@@ -1898,9 +1898,6 @@ pub fn type_hierarchy_subtypes<'db>(
         return vec![];
     };
     direct_subtypes(db, env, target_class, modules)
-        .into_iter()
-        .map(|class_literal| class_literal_to_hierarchy_info(db, class_literal))
-        .collect()
 }
 
 /// Finds classes that directly inherit from `target_class`.
@@ -1917,7 +1914,7 @@ fn direct_subtypes<'db>(
     env: &ProgramEnvironment<'db>,
     target_class: ClassLiteral<'db>,
     modules: &[Module<'db>],
-) -> Vec<ClassLiteral<'db>> {
+) -> Vec<TypeHierarchyClass<'db>> {
     let target_name = target_class.name(db);
     let target_is_object = target_class.is_known(db, KnownClass::Object);
     let target_matcher = NameMatcher::new(target_name.as_str());
@@ -1955,6 +1952,12 @@ fn direct_subtypes<'db>(
 
         let program_file = ProgramFile::new(db, file, env.program(db));
         let file_env = ProgramEnvironment::from_file(program_file);
+
+        // Subtype searches can scan many modules. When dropped, this guard clears the cached AST
+        // if the file was closed when the guard was created, reducing eviction work on the next
+        // database update. Keep the guard through `class_literal_to_hierarchy_info` so collecting
+        // ranges doesn't reload the AST.
+        let ast_guard = parsed_module(db, program_file.python_file(db)).load_clear_on_drop(db);
         for class_ty in reachable_class_literals_in_file(db, program_file) {
             let bases = class_ty.explicit_bases(db);
             let is_subtype = if target_is_object
@@ -1969,9 +1972,11 @@ fn direct_subtypes<'db>(
                 })
             };
             if is_subtype {
-                subtypes.push(class_ty);
+                subtypes.push(class_literal_to_hierarchy_info(db, class_ty));
             }
         }
+
+        drop(ast_guard);
     }
     subtypes
 }
