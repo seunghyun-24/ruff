@@ -95,8 +95,19 @@ pub fn goto_implementation(
         .into_par_iter()
         .map_with_db(db, |db, file| {
             let file = ProgramFile::new(db, file, program);
+            if !finder.may_have_implementations_in_file(db, file) {
+                return Vec::new();
+            }
+
+            // Go-to-implementation searches can scan the whole project. When dropped, this guard
+            // clears the cached AST if the file was closed when the guard was created, reducing
+            // eviction work on the next database update. Keep it until the navigation targets
+            // have been built.
+            let ast_guard = parsed_module(db, file.python_file(db)).load_clear_on_drop(db);
             let definitions = finder.implementations_for_file(db, file);
-            definitions_to_implementation_targets(db, definitions)
+            let targets = definitions_to_implementation_targets(db, definitions);
+            drop(ast_guard);
+            targets
         })
         .collect::<Vec<_>>();
 
