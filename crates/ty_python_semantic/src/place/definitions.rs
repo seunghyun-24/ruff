@@ -18,20 +18,16 @@ use crate::types::ProgramEnvironment;
 /// Resolution also tracks whether values lack explicit definitions, whether the name can be
 /// deleted, and whether lookup crosses a `global` or `nonlocal` declaration.
 #[derive(Debug, Clone, Eq, PartialEq, get_size2::GetSize, salsa::SalsaValue)]
-pub(crate) struct DefinitionResolution<'db> {
+pub struct DefinitionResolution<'db> {
     definitions: SmallVec<[Definition<'db>; 2]>,
     is_complete: bool,
     may_be_deleted: bool,
     crosses_scope_declaration: bool,
 }
 
-#[allow(
-    dead_code,
-    reason = "definition-resolution metadata is retained for IDE consumers"
-)]
 impl<'db> DefinitionResolution<'db> {
     /// Returns the definitions found by name resolution.
-    pub(crate) fn definitions(&self) -> &[Definition<'db>] {
+    pub fn definitions(&self) -> &[Definition<'db>] {
         &self.definitions
     }
 
@@ -39,17 +35,17 @@ impl<'db> DefinitionResolution<'db> {
     ///
     /// Implicit builtin values are incomplete because no explicit import connects the name
     /// to their definitions. A complete resolution can still leave a name possibly unbound.
-    pub(crate) fn is_complete(&self) -> bool {
+    pub fn is_complete(&self) -> bool {
         self.is_complete
     }
 
     /// Returns whether a reachable deletion may leave the value unbound.
-    pub(crate) fn may_be_deleted(&self) -> bool {
+    pub fn may_be_deleted(&self) -> bool {
         self.may_be_deleted
     }
 
     /// Returns whether resolution crosses a `global` or `nonlocal` declaration.
-    pub(crate) fn crosses_scope_declaration(&self) -> bool {
+    pub fn crosses_scope_declaration(&self) -> bool {
         self.crosses_scope_declaration
     }
 
@@ -190,6 +186,50 @@ impl<'db> DefinitionResolution<'db> {
         self.is_complete &= other.is_complete;
         self.may_be_deleted |= other.may_be_deleted;
         self.crosses_scope_declaration |= other.crosses_scope_declaration;
+    }
+}
+
+/// Accumulates the definitions and flags from sources visited during name inference.
+pub(crate) struct DefinitionResolutionBuilder<'db> {
+    resolution: DefinitionResolution<'db>,
+}
+
+impl<'db> DefinitionResolutionBuilder<'db> {
+    pub(crate) fn new() -> Self {
+        Self {
+            resolution: DefinitionResolution {
+                definitions: SmallVec::new(),
+                is_complete: true,
+                may_be_deleted: false,
+                crosses_scope_declaration: false,
+            },
+        }
+    }
+
+    pub(crate) fn add_source(
+        &mut self,
+        db: &'db dyn Db,
+        environment: &ProgramEnvironment<'db>,
+        scope: ScopeId<'db>,
+        source: &PlaceLoadSource<'db>,
+    ) {
+        self.resolution
+            .extend(DefinitionResolution::from_place_load_source(
+                db,
+                environment,
+                scope,
+                source,
+            ));
+    }
+
+    pub(crate) fn mark_incomplete(&mut self) {
+        self.resolution.is_complete = false;
+    }
+
+    pub(crate) fn finish(mut self, crosses_scope_declaration: bool) -> DefinitionResolution<'db> {
+        self.resolution.crosses_scope_declaration |= crosses_scope_declaration;
+        self.resolution.definitions.shrink_to_fit();
+        self.resolution
     }
 }
 

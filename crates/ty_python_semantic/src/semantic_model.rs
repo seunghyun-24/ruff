@@ -29,17 +29,56 @@ use crate::place_load::{
 use crate::types::ide_support::{ImportAliasResolution, definition_for_name};
 use crate::types::list_members::{all_members, all_reachable_members};
 use crate::types::{
-    CycleDetector, ProgramEnvironment, SpecialFormType, Type, TypeQualifiers, binding_type,
-    infer_complete_scope_types, infer_definition_types, inferred_declaration,
-    is_discarded_dict_key_assignment,
+    CycleDetector, DefinitionResolutionsByExpression, ProgramEnvironment, SpecialFormType, Type,
+    TypeQualifiers, binding_type, infer_complete_scope_types, infer_definition_types,
+    inferred_declaration, is_discarded_dict_key_assignment, reaching_definitions_for_scope,
+    scope_for_complete_type_inference,
 };
 use ty_python_core::definition::{Definition, DefinitionKind};
 use ty_python_core::place::PlaceExpr;
 use ty_python_core::place_table;
-use ty_python_core::scope::{FileScopeId, Scope};
+use ty_python_core::scope::{FileScopeId, Scope, ScopeId};
 use ty_python_core::semantic_index;
 use ty_python_core::symbol::Symbol;
 use ty_python_core::{BindingWithConstraintsIterator, Program, ProgramFile};
+
+/// Resolves name loads on demand, reusing results for the duration of an IDE operation.
+///
+/// Create a new instance for each operation and use it only with models from the same Salsa
+/// database revision.
+#[derive(Default)]
+pub struct ReachingDefinitions<'db> {
+    by_scope: FxHashMap<ScopeId<'db>, DefinitionResolutionsByExpression<'db>>,
+}
+
+impl<'db> ReachingDefinitions<'db> {
+    /// Creates an empty operation-local lookup.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Returns the definitions that may supply a name load.
+    ///
+    /// The result may contain synthetic definitions, such as loop headers or nested bindings.
+    /// Returns `None` when inference did not visit this name. For names in string
+    /// annotations, use the model returned by [`SemanticModel::enter_string_annotation`].
+    pub fn for_name(
+        &mut self,
+        model: &SemanticModel<'db>,
+        name: &ast::ExprName,
+    ) -> Option<DefinitionResolution<'db>> {
+        let db = model.db();
+        let file = model.program_file();
+        let scope =
+            scope_for_complete_type_inference(db, model.scope(name.into())?.to_scope_id(db, file));
+        let resolutions = self
+            .by_scope
+            .entry(scope)
+            .or_insert_with(|| reaching_definitions_for_scope(db, scope));
+
+        resolutions.get(&ast::ExprRef::Name(name).into()).cloned()
+    }
+}
 
 /// The primary interface the LSP should use for querying semantic information about a [`File`].
 ///
@@ -1191,10 +1230,16 @@ impl HasType for ast::ExceptHandlerExceptHandler {
 #[cfg(test)]
 mod tests {
     use crate::db::tests::TestDbBuilder;
-    use crate::{HasType, SemanticModel};
+    use crate::{HasType, ReachingDefinitions, SemanticModel};
     use ruff_db::files::system_path_to_file;
     use ruff_db::parsed::parsed_module;
+    use ruff_db::source::source_text;
+    use ruff_python_ast as ast;
+    use ruff_python_ast::visitor::{Visitor, walk_expr};
+    use ruff_python_trivia::textwrap::dedent;
+    use ruff_text_size::Ranged;
     use ty_python_core::ProgramFile;
+    use ty_python_core::definition::DefinitionKind;
 
     #[test]
     fn function_type() -> anyhow::Result<()> {
@@ -1256,5 +1301,257 @@ mod tests {
         assert!(ty.is_class_literal());
 
         Ok(())
+    }
+
+    #[test]
+    fn reaching_definitions_follow_inference_scope_fallback() {
+        assert_name_resolutions(
+            "/src/test.py",
+            "
+            old = 1
+            class C:
+                first = old
+                old = 2
+                second = old
+            ",
+            "old",
+            &[&["old = 1"], &["old = 2"]],
+        );
+    }
+
+    #[test]
+    fn reaching_definitions_include_child_regions() {
+        assert_name_resolutions(
+            "/src/test.py",
+            "
+            old = lambda f: f
+            @old
+            def function(default=old):
+                first = second = old
+                return [old for item in (old,)]
+            ",
+            "old",
+            &[
+                &["old = lambda f: f"],
+                &["old = lambda f: f"],
+                &["old = lambda f: f"],
+                &["old = lambda f: f"],
+                &["old = lambda f: f"],
+            ],
+        );
+    }
+
+    #[test]
+    fn reaching_definitions_respect_deferred_annotations() {
+        assert_name_resolutions(
+            "/src/test.pyi",
+            "
+            import first as value
+            annotation: value.C
+            runtime = [value]
+            import second as value
+            ",
+            "value",
+            &[&["first as value", "second as value"], &["first as value"]],
+        );
+    }
+
+    #[test]
+    fn reaching_definitions_use_lambda_type_context() {
+        assert_name_resolutions(
+            "/src/test.py",
+            "
+            from collections.abc import Callable
+            from typing import Literal
+            function: Callable[[Literal[True]], tuple[int, int]] = lambda flag: (
+                (old := 1) if flag else (old := 2),
+                old,
+            )
+            ",
+            "old",
+            &[&["old := 1"]],
+        );
+    }
+
+    #[test]
+    fn reaching_definitions_follow_the_model_file() {
+        let db = TestDbBuilder::new()
+            .with_file("/src/test.py", "old = 1; value = old")
+            .with_file("/src/other.py", "old = 2; value = old")
+            .build()
+            .unwrap();
+
+        let mut reaching_definitions = ReachingDefinitions::new();
+        for (path, expected) in [
+            ("/src/test.py", "old = 1"),
+            ("/src/other.py", "old = 2"),
+            ("/src/test.py", "old = 1"),
+        ] {
+            let file = system_path_to_file(&db, path).unwrap();
+            let file = ProgramFile::new(&db, file, db.program_environment().program(&db));
+            let module = parsed_module(&db, file.python_file(&db)).load(&db);
+            let model = SemanticModel::new(&db, file);
+            let name = module.suite()[1]
+                .as_assign_stmt()
+                .unwrap()
+                .value
+                .as_name_expr()
+                .unwrap();
+
+            let resolution = reaching_definitions.for_name(&model, name).unwrap();
+
+            assert_eq!(resolution.definitions().len(), 1, "{path}");
+            assert_eq!(
+                &source_text(&db, file.file(&db))
+                    [resolution.definitions()[0].full_range(&db, &module).range()],
+                expected,
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn reaching_definitions_support_string_annotation_models() {
+        let db = TestDbBuilder::new()
+            .with_file(
+                "/src/test.py",
+                &dedent(
+                    "
+                    class Old: pass
+                    value = Old
+                    annotated: \"Old\"
+                    ",
+                ),
+            )
+            .build()
+            .unwrap();
+        let file = system_path_to_file(&db, "/src/test.py").unwrap();
+        let file = ProgramFile::new(&db, file, db.program_environment().program(&db));
+        let module = parsed_module(&db, file.python_file(&db)).load(&db);
+        let model = SemanticModel::new(&db, file);
+        let name = module.suite()[1]
+            .as_assign_stmt()
+            .unwrap()
+            .value
+            .as_name_expr()
+            .unwrap();
+        let annotation = module.suite()[2]
+            .as_ann_assign_stmt()
+            .unwrap()
+            .annotation
+            .as_string_literal_expr()
+            .unwrap();
+        let (parsed, submodel) = model.enter_string_annotation(annotation).unwrap();
+        let annotation_name = parsed.expr().as_name_expr().unwrap();
+
+        let mut reaching_definitions = ReachingDefinitions::new();
+        let resolution = reaching_definitions.for_name(&model, name).unwrap();
+        let annotation_resolution = reaching_definitions
+            .for_name(&submodel, annotation_name)
+            .unwrap();
+
+        assert_eq!(resolution.definitions().len(), 1);
+        assert_eq!(
+            &source_text(&db, file.file(&db))
+                [resolution.definitions()[0].full_range(&db, &module).range()],
+            "class Old: pass"
+        );
+        assert_eq!(resolution, annotation_resolution);
+    }
+
+    #[test]
+    fn reaching_definitions_preserve_synthetic_bindings() {
+        let db = TestDbBuilder::new()
+            .with_file(
+                "/src/test.py",
+                &dedent(
+                    "
+                    items = [1]
+                    result = [(value := item) for item in items]
+                    final_value = value
+                    ",
+                ),
+            )
+            .build()
+            .unwrap();
+        let file = system_path_to_file(&db, "/src/test.py").unwrap();
+        let file = ProgramFile::new(&db, file, db.program_environment().program(&db));
+        let module = parsed_module(&db, file.python_file(&db)).load(&db);
+        let model = SemanticModel::new(&db, file);
+        let name = module.suite()[2]
+            .as_assign_stmt()
+            .unwrap()
+            .value
+            .as_name_expr()
+            .unwrap();
+
+        let mut reaching_definitions = ReachingDefinitions::new();
+        let resolution = reaching_definitions.for_name(&model, name).unwrap();
+
+        assert!(
+            matches!(
+                resolution.definitions(),
+                [definition] if matches!(definition.kind(&db), DefinitionKind::NestedBindings(_))
+            ),
+            "{resolution:?}"
+        );
+    }
+
+    #[track_caller]
+    fn assert_name_resolutions(path: &str, source: &str, sought_name: &str, expected: &[&[&str]]) {
+        let source = dedent(source);
+        let db = TestDbBuilder::new()
+            .with_file(path, &source)
+            .build()
+            .unwrap();
+        let file = system_path_to_file(&db, path).unwrap();
+        let file = ProgramFile::new(&db, file, db.program_environment().program(&db));
+        let module = parsed_module(&db, file.python_file(&db)).load(&db);
+        let model = SemanticModel::new(&db, file);
+        let mut names = NameCollector {
+            sought_name,
+            names: Vec::new(),
+        };
+        names.visit_body(module.suite());
+
+        let mut reaching_definitions = ReachingDefinitions::new();
+        let actual: Vec<Vec<String>> = names
+            .names
+            .into_iter()
+            .map(|name| {
+                let resolution = reaching_definitions
+                    .for_name(&model, name)
+                    .unwrap_or_else(|| panic!("no resolution for {name:?} in {source}"));
+                resolution
+                    .definitions()
+                    .iter()
+                    .map(|definition| {
+                        let definition_file = definition.program_file(&db).python_file(&db);
+                        let module = parsed_module(&db, definition_file).load(&db);
+                        let source = source_text(&db, definition_file.file(&db));
+                        source[definition.full_range(&db, &module).range()].to_string()
+                    })
+                    .collect()
+            })
+            .collect();
+
+        assert_eq!(actual, expected, "{source}");
+    }
+
+    struct NameCollector<'ast, 'name> {
+        sought_name: &'name str,
+        names: Vec<&'ast ast::ExprName>,
+    }
+
+    impl<'ast> Visitor<'ast> for NameCollector<'ast, '_> {
+        fn visit_expr(&mut self, expression: &'ast ast::Expr) {
+            if let ast::Expr::Name(name) = expression
+                && name.ctx.is_load()
+                && name.id == self.sought_name
+            {
+                self.names.push(name);
+            }
+            walk_expr(self, expression);
+        }
     }
 }
