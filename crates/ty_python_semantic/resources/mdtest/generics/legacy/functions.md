@@ -3242,6 +3242,40 @@ def caller(before: list[int], value: T, after: list[int]) -> None:
     strings(*before, value, *after)
 ```
 
+## Inference across tuple-union argument lengths
+
+Members of an unpacked tuple union can infer different specializations of one generic signature. The
+result includes each member's return type.
+
+```py
+from typing import TypeVar
+
+T = TypeVar("T")
+
+def first(a: T, b: object = 0, c: object = 0) -> T:
+    return a
+
+def _(values: tuple[int] | tuple[str, str]) -> None:
+    reveal_type(first(*values, None))  # revealed: int | str
+```
+
+## Inference with a variadic positional parameter
+
+A typed argument between two unpacks can determine the type variable of a named parameter, while the
+final unpack fills the variadic parameter.
+
+```py
+from typing import TypeVar
+
+T = TypeVar("T")
+
+def middle(a: int, values: list[T], *rest: int) -> T:
+    return values[0]
+
+def _(before: list[int], values: list[str], after: list[int]) -> None:
+    reveal_type(middle(*before, values, *after))  # revealed: str
+```
+
 ## Generic property setter overrides
 
 A method-scoped type variable is inferred for each write, so an unconstrained setter preserves an

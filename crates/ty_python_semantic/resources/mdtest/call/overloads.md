@@ -2048,6 +2048,53 @@ def _(before: list[int], after: list[int], text: str, data: bytes) -> None:
     reveal_type(f(*before, data, *after))  # revealed: bytes
 ```
 
+### Alternative positional placements retain variadic overload preference
+
+An unknown-length unpack that reaches a variadic parameter prefers that overload. An unpack whose
+compatible placements all end before that parameter does not affect overload preference.
+
+`overloaded.pyi`:
+
+```pyi
+from typing import overload
+
+@overload
+def f(a: int, text: str) -> str: ...
+@overload
+def f(a: int, text: str, *rest: int) -> bytes: ...
+```
+
+```py
+from overloaded import f
+
+def _(before: list[int], after: list[int], text: str) -> None:
+    reveal_type(f(*before, text, *after))  # revealed: bytes
+    reveal_type(f(*before, text))  # revealed: str
+```
+
+### Tuple-union expansion rematches later positional arguments
+
+An explicit argument can be compatible after the unpacked tuple's length is known, even if it did
+not fit the provisional argument-to-parameter mapping.
+
+`overloaded.pyi`:
+
+```pyi
+from typing import overload
+
+@overload
+def f(a: int, b: str, c: str = "") -> str: ...
+@overload
+def f(a: int, b: int, c: int = 0) -> int: ...
+```
+
+```py
+from overloaded import f
+
+def _(values: tuple[int] | tuple[int, str]) -> None:
+    reveal_type(f(*values, "text"))  # revealed: str
+```
+
 ### Variadic argument with generics
 
 `overloaded.pyi`:

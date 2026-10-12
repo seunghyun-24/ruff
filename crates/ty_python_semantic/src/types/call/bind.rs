@@ -3890,6 +3890,11 @@ impl<'db> CallableBinding<'db> {
         let (should_retry_after_provisional_arity, overloads_for_expansion) = if self
             .should_retry_after_provisional_arity(&argument_expansions)
         {
+            if let [overload] = self.overloads.as_mut_slice() {
+                // Preserve the ordinary call's type diagnostics if none of the expanded
+                // argument lists succeeds.
+                overload.check_types(db, env, call_arguments.as_ref(), call_expression_tcx);
+            }
             // We will retry all overloads after argument expansion.
             (true, (0..self.overloads.len()).collect())
         } else {
@@ -3913,7 +3918,14 @@ impl<'db> CallableBinding<'db> {
                         call_arguments.as_ref(),
                         call_expression_tcx,
                     );
-                    return;
+                    if !self.overloads[index].has_errors_affecting_overload_resolution()
+                        || !argument_expansions.has_expandable_variadic()
+                    {
+                        return;
+                    }
+                    // A single signature can also require different placements for the
+                    // members of an unpacked tuple union. Every expanded call must succeed.
+                    (false, vec![index])
                 }
                 MatchingOverloadIndex::Multiple(indexes) => (false, indexes),
             }
@@ -4001,10 +4013,14 @@ impl<'db> CallableBinding<'db> {
         // This heuristic tries to detect if there's any need to perform argument type expansion or
         // not by checking whether there are any non-expandable argument type that cannot be
         // assigned to any of the overloads.
+        let positions_can_change = argument_expansions.has_expandable_variadic();
         for (argument_index, call_argument) in call_arguments.iter().enumerate() {
             let argument = call_argument.kind();
             // TODO: Remove `Keywords` once `**kwargs` support is added
-            if matches!(argument, Argument::Synthetic | Argument::Keywords) {
+            if positions_can_change || matches!(argument, Argument::Synthetic | Argument::Keywords)
+            {
+                // An unpacked union can move later arguments to different parameters, so
+                // their provisional matches cannot rule out all expanded calls.
                 continue;
             }
             // TODO: For types inferred multiple times with distinct type context, we currently only
@@ -4233,7 +4249,7 @@ impl<'db> CallableBinding<'db> {
         &self,
         expansions: &CallArgumentExpansions<'_, '_, 'db>,
     ) -> bool {
-        self.overloads.len() > 1
+        !self.overloads.is_empty()
             && self.matching_overloads().count() < self.overloads.len()
             && expansions.has_expandable_variadic()
     }
@@ -7827,6 +7843,24 @@ impl<'db> Binding<'db> {
             .get(argument_index + usize::from(binding.bound_type.is_some()))
     }
 
+    /// Retain every candidate position across argument-inference rounds, including positions
+    /// that become precise only after expanding a tuple union.
+    fn possible_matched_argument_for_call_argument(
+        &self,
+        binding: &CallableBinding<'db>,
+        argument_index: usize,
+    ) -> Option<&MatchedArgument<'db>> {
+        self.positional_matches
+            .as_ref()
+            .and_then(|positional| {
+                positional
+                    .arguments
+                    .get(argument_index + usize::from(binding.bound_type.is_some()))
+            })
+            .filter(|matched| matched.matched)
+            .or_else(|| self.matched_argument_for_call_argument(binding, argument_index))
+    }
+
     /// Returns the number of occurrences of inferable type variables in the parameter(s) matching the
     /// provided argument index.
     pub(crate) fn typevar_occurrences_for_parameter(
@@ -7839,7 +7873,8 @@ impl<'db> Binding<'db> {
         let Some(generic_context) = self.signature.generic_context else {
             return 0;
         };
-        let Some(argument) = self.matched_argument_for_call_argument(binding, argument_index)
+        let Some(argument) =
+            self.possible_matched_argument_for_call_argument(binding, argument_index)
         else {
             return 0;
         };
@@ -8073,17 +8108,11 @@ impl<'db> Binding<'db> {
         call_expression_tcx: TypeContext<'db>,
         specialization: impl Fn() -> Option<Specialization<'db>>,
     ) -> SmallVec<[Option<ArgumentTypeContext<'db>>; 1]> {
-        let argument_matches = self
-            .positional_matches
-            .as_ref()
-            .filter(|_| all_positions)
-            .and_then(|positional| {
-                positional
-                    .arguments
-                    .get(argument_index + usize::from(binding.bound_type.is_some()))
-            })
-            .filter(|matched| matched.matched)
-            .or_else(|| self.matched_argument_for_call_argument(binding, argument_index));
+        let argument_matches = if all_positions {
+            self.possible_matched_argument_for_call_argument(binding, argument_index)
+        } else {
+            self.matched_argument_for_call_argument(binding, argument_index)
+        };
         let Some(argument_matches) =
             argument_matches.filter(|matched| !matched.parameters.is_empty())
         else {
@@ -8397,8 +8426,13 @@ impl<'db> Binding<'db> {
         } else {
             None
         };
-        if let Some(positional_matches) = &positional_matches {
+        let direct_positional_matches = positional_matches
+            .as_ref()
+            .filter(|positional| !positional.requires_expansion);
+        if let Some(positional_matches) = direct_positional_matches {
             matcher.argument_matches = positional_matches.arguments.to_vec();
+            matcher.variadic_argument_matched_to_variadic_parameter =
+                positional_matches.variadic_argument_matched;
             matcher.num_synthetic_args = arguments
                 .iter()
                 .filter(|argument| matches!(argument, CallArgument::Synthetic(_)))
@@ -8415,7 +8449,7 @@ impl<'db> Binding<'db> {
         for (argument_index, argument) in arguments.iter().enumerate() {
             match argument {
                 CallArgument::Positional(_) | CallArgument::Synthetic(_) => {
-                    if positional_matches.is_none() {
+                    if direct_positional_matches.is_none() {
                         let _ =
                             matcher.match_positional(argument_index, argument.kind(), None, false);
                     }
@@ -8424,7 +8458,7 @@ impl<'db> Binding<'db> {
                     let _ = matcher.match_keyword(argument_index, argument.kind(), None, name);
                 }
                 CallArgument::Variadic(variadic) => {
-                    if positional_matches.is_none() {
+                    if direct_positional_matches.is_none() {
                         let _ = matcher.match_variadic(db, env, argument_index, variadic);
                     }
                 }
@@ -8486,7 +8520,11 @@ impl<'db> Binding<'db> {
             .signature
             .generic_context
             .map_or(TypeVarSet::None, |context| context.inferable_typevars(db));
-        let positional_constraints = if let Some(positional) = &self.positional_matches {
+        let positional_constraints = if let Some(positional) = self
+            .positional_matches
+            .as_ref()
+            .filter(|positional| !positional.requires_expansion)
+        {
             let Some(evaluated) = positional
                 .evaluate(
                     db,
@@ -8514,6 +8552,8 @@ impl<'db> Binding<'db> {
                     self.argument_matches[index] = evaluated.arguments[index].clone();
                 }
             }
+            self.variadic_argument_matched_to_variadic_parameter =
+                evaluated.variadic_argument_matched;
             Some(evaluated.constraints)
         } else {
             None
@@ -8843,6 +8883,8 @@ impl<'db> Binding<'db> {
             inference: self.inference,
             argument_matches: self.argument_matches.clone(),
             positional_matches: self.positional_matches.clone(),
+            variadic_argument_matched_to_variadic_parameter: self
+                .variadic_argument_matched_to_variadic_parameter,
             parameter_tys: self.parameter_tys.clone(),
             errors: self.errors.clone(),
         }
@@ -8855,6 +8897,7 @@ impl<'db> Binding<'db> {
             inference,
             argument_matches,
             positional_matches,
+            variadic_argument_matched_to_variadic_parameter,
             parameter_tys,
             errors,
         } = snapshot;
@@ -8864,6 +8907,8 @@ impl<'db> Binding<'db> {
         self.inference = inference;
         self.argument_matches = argument_matches;
         self.positional_matches = positional_matches;
+        self.variadic_argument_matched_to_variadic_parameter =
+            variadic_argument_matched_to_variadic_parameter;
         self.parameter_tys = parameter_tys;
         self.errors = errors;
     }
@@ -8920,6 +8965,7 @@ struct BindingSnapshot<'db> {
     inference: Option<TypeVarInference<'db>>,
     argument_matches: Box<[MatchedArgument<'db>]>,
     positional_matches: Option<Arc<PositionalMatches<'db>>>,
+    variadic_argument_matched_to_variadic_parameter: bool,
     parameter_tys: Box<[Option<Type<'db>>]>,
     errors: Vec<BindingError<'db>>,
 }
@@ -8965,6 +9011,8 @@ impl CallableBindingSnapshot<'_> {
                 snapshot
                     .positional_matches
                     .clone_from(&binding.positional_matches);
+                snapshot.variadic_argument_matched_to_variadic_parameter =
+                    binding.variadic_argument_matched_to_variadic_parameter;
                 snapshot.parameter_tys.clone_from(&binding.parameter_tys);
             }
 
@@ -8988,7 +9036,7 @@ struct CallableBindingSnapshotter(Vec<usize>);
 impl CallableBindingSnapshotter {
     /// Creates a new snapshotter for the given indexes of the matched overloads.
     fn new(indexes: Vec<usize>) -> Self {
-        debug_assert!(indexes.len() > 1);
+        debug_assert!(!indexes.is_empty());
         CallableBindingSnapshotter(indexes)
     }
 

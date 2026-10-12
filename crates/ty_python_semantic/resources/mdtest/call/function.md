@@ -808,8 +808,8 @@ def _(args: tuple[int, *tuple[str, ...], int]) -> None:
     takes_two_different_positional_only(*args)
     takes_at_least_zero(*args)
     takes_at_least_one(*args)
-    takes_at_least_two(*args)  # error: [invalid-argument-type]
-    takes_at_least_two_positional_only(*args)  # error: [invalid-argument-type]
+    takes_at_least_two(*args)  # no diagnostic
+    takes_at_least_two_positional_only(*args)  # no diagnostic
 ```
 
 ### Subclass of mixed tuple argument
@@ -939,11 +939,9 @@ def _(args: IntStarStrInt) -> None:
 
     takes_at_least_one(*args)
 
-    # error: [invalid-argument-type]
-    takes_at_least_two(*args)
+    takes_at_least_two(*args)  # no diagnostic
 
-    # error: [invalid-argument-type]
-    takes_at_least_two_positional_only(*args)
+    takes_at_least_two_positional_only(*args)  # no diagnostic
 ```
 
 ### String argument
@@ -1204,15 +1202,39 @@ def f23(x: tuple[int, int] | tuple[int, int, int]) -> None:
 
 ### Tuple unions followed by positional arguments
 
-When a tuple union is followed by another positional argument, we currently combine its element
-types before checking the call. Here, we treat the tuple as an iterable of `int | str`. This reports
-an error for both `a` and `b`, even though only `b` can receive a `str`:
+Each member of an unpacked tuple union can place a later argument at a different parameter. Every
+member must produce a valid call; a shorter member cannot hide an incompatible longer member.
 
 ```py
-def f(a: int, b: int, c: int = 0) -> None: ...
-def _(args: tuple[int] | tuple[int, str]) -> None:
+def strings(a: int, b: str, c: str = "") -> None: ...
+def integers(a: int, b: int, c: int = 0) -> None: ...
+def _(values: tuple[int] | tuple[int, str]) -> None:
+    strings(*values, "text")  # no diagnostic
     # error: [invalid-argument-type]
-    f(*args, 1)  # error: [invalid-argument-type]
+    # error: [invalid-argument-type]
+    integers(*values, 1)
+```
+
+Tuple-union members also retain their required lengths when combined with another unknown-length
+unpack:
+
+```py
+def f(a: int, text: str, b: int, c: int = 0) -> None: ...
+def _(before: list[int], text: str, after: tuple[int] | tuple[int, int]) -> None:
+    f(*before, text, *after)  # no diagnostic
+```
+
+Later arguments receive type context from the positions allowed by the tuple union:
+
+```py
+from typing import TypedDict
+
+class Payload(TypedDict):
+    count: int
+
+def contextual(a: int, b: Payload, c: Payload | None = None) -> None: ...
+def _(values: tuple[int] | tuple[int, Payload]) -> None:
+    contextual(*values, {"count": 1})  # no diagnostic
 ```
 
 ### Mixed argument and parameter containing variadic
@@ -1442,8 +1464,7 @@ def _(args: tuple[str, *tuple[str, ...], float, float]) -> None:
 
 ### Later positional arguments and variadic parameters
 
-When the callable has a variadic parameter, we still assume the unpacked iterable fills the named
-positional parameters. Later arguments then go to the variadic parameter:
+An unpacked iterable can fill the named parameters while a later argument goes to `*args`:
 
 ```py
 def log(fmt: str, *args: object) -> None: ...
@@ -1451,16 +1472,36 @@ def _(parts: list[str]) -> None:
     log(*parts, 1)  # no diagnostic
 ```
 
-This remains a limitation: we reject calls that would succeed if the iterable were shorter. With two
-strings in `args`, `1.0` would fill `c`:
+A later positional argument can fill a named parameter even when the signature also has a variadic
+parameter. We consider where the unpack ends before deciding which parameter receives that argument.
 
 ```py
-def v(a: str, b: str, c: float, *rest: str) -> None: ...
-def _(args: list[str]) -> None:
-    # TODO: Accept this call.
-    # error: [invalid-argument-type] "Expected `float`, found `str`"
-    # error: [invalid-argument-type] "Expected `str`"
-    v(*args, 1.0)
+def f(a: str, b: str, c: float, *rest: str) -> None: ...
+def _(before: list[str]) -> None:
+    f(*before, 1.0)  # no diagnostic
+    f(*before, 1.0, "tail")  # no diagnostic
+    f(*before, b"bad")  # error: [invalid-argument-type]
+```
+
+The argument can also appear between two unpacked iterables:
+
+```py
+def g(a: int, text: str, *rest: int) -> None: ...
+def _(before: list[int], text: str, after: list[int]) -> None:
+    g(*before, text, *after)  # no diagnostic
+```
+
+When an unpacked iterable reaches a variadic parameter, we still check its element type, even though
+the iterable could be empty:
+
+```py
+def integers(*args: int) -> None: ...
+def _(strings: list[str]) -> None:
+    integers(*strings, 1)  # error: [invalid-argument-type]
+    integers(1, *strings)  # error: [invalid-argument-type]
+    # error: [invalid-argument-type]
+    # error: [invalid-argument-type]
+    integers(*strings, *strings)
 ```
 
 ### Positional arguments between variable-length unpacks
