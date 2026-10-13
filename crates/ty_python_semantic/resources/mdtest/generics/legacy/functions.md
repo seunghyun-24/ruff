@@ -3252,11 +3252,11 @@ from typing import TypeVar
 
 T = TypeVar("T")
 
-def first(a: T, b: object = 0, c: object = 0) -> T:
+def first(a: T, b: str, c: str = "") -> T:
     return a
 
 def _(values: tuple[int] | tuple[str, str]) -> None:
-    reveal_type(first(*values, None))  # revealed: int | str
+    reveal_type(first(*values, "text"))  # revealed: int | str
 ```
 
 ## Inference with a variadic positional parameter

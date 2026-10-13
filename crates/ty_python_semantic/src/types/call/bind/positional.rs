@@ -194,14 +194,22 @@ impl<'db> PositionalMatches<'db> {
         segment * (self.parameter_count + 1) + parameter
     }
 
-    /// Once an unpack reaches a variadic parameter, check its element type even though its
-    /// length might be zero. Otherwise `ints(*strings, 1)` would accept `list[str]` for `*args: int`.
+    /// Whether an unpack can stop before matching the current parameter.
+    ///
+    /// At a variadic parameter, we check its element type even if the iterable might be empty:
+    ///
+    /// ```python
+    /// def ints(*args: int): ...
+    /// def call(strings: list[str]):
+    ///     ints(*strings, 1)  # str is not assignable to int
+    /// ```
     fn can_skip(&self, index: usize, position: usize) -> bool {
         self.segments[index].repeated && !(self.variadic && position == self.parameter_count)
     }
 
-    /// Advance through one required value or one element of a repeated segment. At a variadic
-    /// parameter, one comparison covers the entire repeated segment, avoiding a self-loop.
+    /// Returns the next state after consuming a value, or `None` if the parameter cannot accept it
+    /// positionally. At a variadic parameter, one comparison covers the entire repeated segment;
+    /// advancing past that segment keeps the state graph acyclic.
     fn next_state(&self, index: usize, position: usize) -> Option<usize> {
         if !self.can_consume.get(position).copied().unwrap_or(false) {
             return None;
@@ -316,6 +324,9 @@ impl<'db> PositionalMatches<'db> {
     /// placement. Keyword arguments filter these matches, but the caller still infers their
     /// constraints separately.
     /// Returns `None` when the ordinary matcher should diagnose the call.
+    ///
+    /// Callers must expand unpacked arguments with union types before evaluation:
+    /// `requires_expansion` must be `false`.
     pub(super) fn evaluate<'c>(
         &self,
         db: &'db dyn Db,

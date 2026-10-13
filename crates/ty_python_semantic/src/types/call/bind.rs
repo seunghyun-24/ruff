@@ -4249,8 +4249,7 @@ impl<'db> CallableBinding<'db> {
         &self,
         expansions: &CallArgumentExpansions<'_, '_, 'db>,
     ) -> bool {
-        !self.overloads.is_empty()
-            && self.matching_overloads().count() < self.overloads.len()
+        self.matching_overloads().count() < self.overloads.len()
             && expansions.has_expandable_variadic()
     }
 
@@ -7845,6 +7844,7 @@ impl<'db> Binding<'db> {
 
     /// Retain every candidate position across argument-inference rounds, including positions
     /// that become precise only after expanding a tuple union.
+    /// For keyword arguments, or when `positional_matches` is absent, use the ordinary matches.
     fn possible_matched_argument_for_call_argument(
         &self,
         binding: &CallableBinding<'db>,
