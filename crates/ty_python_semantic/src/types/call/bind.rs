@@ -400,11 +400,10 @@ impl<'db> CallableItem<'db> {
     }
 
     fn as_result(&self, db: &'db dyn Db) -> Result<(), CallErrorKind> {
-        self.callable().as_result()?;
-
-        self.as_constructor()
-            .and_then(|binding| binding.downstream_constructor())
-            .map_or(Ok(()), |bindings| bindings.as_result(db))
+        match self {
+            Self::Regular(binding) => binding.as_result(),
+            Self::Constructor(binding) => binding.as_result(db),
+        }
     }
 
     fn has_own_diagnostics(&self) -> bool {
@@ -973,16 +972,25 @@ impl<'db> Bindings<'db> {
                 let start = functions.len();
                 for item in &element.items {
                     let item_start = functions.len();
-                    let callable = item.callable();
-                    functions.extend(
-                        callable
-                            .deprecated_functions(db)
-                            .map(|function| (callable, function)),
-                    );
-                    if let Some(constructor) = item.as_constructor()
-                        && let Some(downstream) = constructor.downstream_constructor()
-                    {
-                        collect(db, downstream, functions);
+                    if let Some(constructor) = item.as_constructor() {
+                        for evaluation in constructor.evaluated_calls() {
+                            let callable = evaluation.callable();
+                            functions.extend(
+                                callable
+                                    .deprecated_functions(db)
+                                    .map(|function| (callable, function)),
+                            );
+                            if let Some(downstream) = evaluation.downstream_constructor() {
+                                collect(db, downstream, functions);
+                            }
+                        }
+                    } else {
+                        let callable = item.callable();
+                        functions.extend(
+                            callable
+                                .deprecated_functions(db)
+                                .map(|function| (callable, function)),
+                        );
                     }
                     if functions.len() == item_start {
                         // This intersection member provides a non-deprecated alternative.
@@ -1092,6 +1100,19 @@ impl<'db> Bindings<'db> {
                 && let Some(downstream) = &constructor.downstream_constructor
             {
                 downstream.visit_type_context_callables(visit);
+            }
+        }
+    }
+
+    /// Visit the completed constructor alternatives when committing argument inference.
+    pub(crate) fn visit_evaluated_type_context_callables<'a>(
+        &'a self,
+        visit: &mut impl FnMut(&'a CallableBinding<'db>),
+    ) {
+        for item in self.iter_callable_items() {
+            match item {
+                CallableItem::Regular(binding) => visit(binding),
+                CallableItem::Constructor(binding) => binding.visit_evaluated_callables(visit),
             }
         }
     }
@@ -1344,14 +1365,16 @@ impl<'db> Bindings<'db> {
     /// Whether argument inference needs to consider multiple positional placements, even for a
     /// single signature. Such arguments need the same inference rounds as overloaded calls.
     pub(crate) fn has_ambiguous_positional_arguments(&self) -> bool {
-        self.iter_flat()
-            .flat_map(|binding| &binding.overloads)
-            .any(|overload| {
+        let mut ambiguous = false;
+        self.visit_type_context_callables(&mut |binding| {
+            ambiguous |= binding.overloads.iter().any(|overload| {
                 overload
                     .positional_matches
                     .as_ref()
                     .is_some_and(|positional| positional.has_ambiguous_argument_contexts())
-            })
+            });
+        });
+        ambiguous
     }
 
     /// Verify that the type of each argument is assignable to type of the parameter that it was
@@ -8417,10 +8440,8 @@ impl<'db> Binding<'db> {
     ) {
         let parameters = self.signature.parameters();
         let mut matcher = ArgumentMatcher::new(arguments, parameters, &mut self.errors);
-        // Constructor inference combines evidence from several methods into one specialization.
-        // Use the ordinary matcher until it can preserve complete alternatives across that chain.
+        let constructor_lengths = arguments.constructor_lengths();
         let positional_matches = if use_positional_matching
-            && self.constructor_context.is_none()
             && self.signature.generic_context.is_none_or(|context| {
                 context
                     .variables(db)
@@ -8432,18 +8453,32 @@ impl<'db> Binding<'db> {
                 arguments,
                 parameters,
                 &matcher.explicit_keyword_parameters,
+                constructor_lengths.is_some(),
             )
             .map(Arc::new)
         } else {
             None
         };
-        let direct_positional_matches = positional_matches
-            .as_ref()
-            .filter(|positional| !positional.requires_expansion);
+        let selected_matches = constructor_lengths
+            .and_then(|lengths| positional_matches.as_ref()?.at_lengths(arguments, lengths));
+        if constructor_lengths.is_some() && selected_matches.is_none() {
+            matcher.errors.push(BindingError::UnmatchedOverload);
+        }
+        let direct_positional_matches = positional_matches.as_ref().filter(|positional| {
+            !positional.requires_expansion
+                && (self.constructor_context.is_none() || selected_matches.is_some())
+        });
         if let Some(positional_matches) = direct_positional_matches {
-            matcher.argument_matches = positional_matches.arguments.to_vec();
+            matcher.argument_matches = selected_matches
+                .as_ref()
+                .map(|(arguments, _)| arguments.as_ref())
+                .unwrap_or(&positional_matches.arguments)
+                .to_vec();
             matcher.variadic_argument_matched_to_variadic_parameter =
-                positional_matches.variadic_argument_matched;
+                selected_matches.as_ref().map_or(
+                    positional_matches.variadic_argument_matched,
+                    |(_, matched)| *matched,
+                );
             matcher.num_synthetic_args = arguments
                 .iter()
                 .filter(|argument| matches!(argument, CallArgument::Synthetic(_)))
@@ -8485,7 +8520,11 @@ impl<'db> Binding<'db> {
         self.variadic_argument_matched_to_variadic_parameter =
             matcher.variadic_argument_matched_to_variadic_parameter;
         self.argument_matches = matcher.finish(db, env);
-        self.positional_matches = positional_matches;
+        self.positional_matches = if constructor_lengths.is_some() {
+            None
+        } else {
+            positional_matches
+        };
     }
 
     fn check_types(
@@ -8531,11 +8570,10 @@ impl<'db> Binding<'db> {
             .signature
             .generic_context
             .map_or(TypeVarSet::None, |context| context.inferable_typevars(db));
-        let positional_constraints = if let Some(positional) = self
-            .positional_matches
-            .as_ref()
-            .filter(|positional| !positional.requires_expansion)
-        {
+        let positional_constraints = if let Some(positional) =
+            self.positional_matches.as_ref().filter(|positional| {
+                self.constructor_context.is_none() && !positional.requires_expansion
+            }) {
             let Some(evaluated) = positional
                 .evaluate(
                     db,
