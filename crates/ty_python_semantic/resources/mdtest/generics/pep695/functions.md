@@ -3907,10 +3907,10 @@ def caller[T](before: list[int], value: T, after: list[int]) -> None:
     strings(*before, value, *after)
 ```
 
-## Inference across tuple-union argument lengths
+## Inference from an unpacked union of tuples
 
-Members of an unpacked tuple union can infer different specializations of one generic signature. The
-result includes each member's return type.
+`T` is inferred separately for each member of `values`. The one-element tuple gives `int`, and the
+two-element tuple gives `str`. The return type includes both.
 
 ```py
 def first[T](a: T, b: str, c: str = "") -> T:
@@ -3922,8 +3922,7 @@ def _(values: tuple[int] | tuple[str, str]) -> None:
 
 ## Inference with a variadic positional parameter
 
-A typed argument between two unpacks can determine the type variable of a named parameter, while the
-final unpack fills the variadic parameter.
+The `values` argument determines `T`; the last unpack can supply the integers for `*rest`.
 
 ```py
 def middle[T](a: int, values: list[T], *rest: int) -> T:

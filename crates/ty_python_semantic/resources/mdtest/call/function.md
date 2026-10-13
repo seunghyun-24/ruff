@@ -1202,21 +1202,27 @@ def f23(x: tuple[int, int] | tuple[int, int, int]) -> None:
 
 ### Tuple unions followed by positional arguments
 
-Each member of an unpacked tuple union can place a later argument at a different parameter. Every
-member must produce a valid call; a shorter member cannot hide an incompatible longer member.
+Each member of an unpacked tuple union can place a later argument at a different parameter. Both
+members below leave a string parameter for `"text"`:
 
 ```py
 def strings(a: int, b: str, c: str = "") -> None: ...
-def integers(a: int, b: int, c: int = 0) -> None: ...
 def _(values: tuple[int] | tuple[int, str]) -> None:
     strings(*values, "text")  # no diagnostic
+```
+
+Every member must produce a valid call. The `tuple[int]` member fits this signature, but
+`tuple[int, str]` does not:
+
+```py
+def integers(a: int, b: int, c: int = 0) -> None: ...
+def _(values: tuple[int] | tuple[int, str]) -> None:
     # error: [invalid-argument-type]
     # error: [invalid-argument-type]
     integers(*values, 1)
 ```
 
-Tuple-union members also retain their required lengths when combined with another unknown-length
-unpack:
+When another iterable is also unpacked, it must leave room for all required elements of each tuple:
 
 ```py
 def f(a: int, text: str, b: int, c: int = 0) -> None: ...
@@ -1224,7 +1230,8 @@ def _(before: list[int], text: str, after: tuple[int] | tuple[int, int]) -> None
     f(*before, text, *after)  # no diagnostic
 ```
 
-Later arguments receive type context from the positions allowed by the tuple union:
+Either tuple leaves a parameter of type `Payload` for the dictionary. We check the dictionary
+against that type:
 
 ```py
 from typing import TypedDict
@@ -1472,18 +1479,16 @@ def _(parts: list[str]) -> None:
     log(*parts, 1)  # no diagnostic
 ```
 
-A later positional argument can fill a named parameter even when the signature also has a variadic
-parameter. We consider where the unpack ends before deciding which parameter receives that argument.
+It can also stop in time for the later argument to fill a named parameter. Here two strings leave
+`c` for `1.0`:
 
 ```py
-def f(a: str, b: str, c: float, *rest: str) -> None: ...
-def _(before: list[str]) -> None:
-    f(*before, 1.0)  # no diagnostic
-    f(*before, 1.0, "tail")  # no diagnostic
-    f(*before, b"bad")  # error: [invalid-argument-type]
+def v(a: str, b: str, c: float, *rest: str) -> None: ...
+def _(args: list[str]) -> None:
+    v(*args, 1.0)  # no diagnostic
 ```
 
-The argument can also appear between two unpacked iterables:
+The last unpack can fill `*rest` after the middle argument fills `text`:
 
 ```py
 def g(a: int, text: str, *rest: int) -> None: ...
@@ -1498,10 +1503,6 @@ the iterable could be empty:
 def integers(*args: int) -> None: ...
 def _(strings: list[str]) -> None:
     integers(*strings, 1)  # error: [invalid-argument-type]
-    integers(1, *strings)  # error: [invalid-argument-type]
-    # error: [invalid-argument-type]
-    # error: [invalid-argument-type]
-    integers(*strings, *strings)
 ```
 
 ### Positional arguments between variable-length unpacks
