@@ -3281,7 +3281,7 @@ Either the unpack or `ints` can fill `value`, and any remaining arguments go to 
 can be an integer list or a string list; an integer cannot safely be appended to both.
 
 ```py
-from typing import Generic, TypeVar
+from typing import TypeVar
 
 T = TypeVar("T")
 
@@ -3292,19 +3292,6 @@ def _(before: list[list[str]], ints: list[int]) -> None:
     result = first(*before, ints)
     reveal_type(result)  # revealed: list[int] | list[str]
     result.append(1)  # error: [invalid-argument-type]
-```
-
-The same two choices determine the type of a constructed instance.
-
-```py
-class Box(Generic[T]):
-    def __init__(self, value: list[T], *rest: object):
-        self.value = value
-
-def _(before: list[list[str]], ints: list[int]) -> None:
-    result = Box(*before, ints)
-    reveal_type(result)  # revealed: Box[int] | Box[str]
-    result.value.append(1)  # error: [invalid-argument-type]
 ```
 
 ## Generic property setter overrides

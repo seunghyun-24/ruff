@@ -3887,6 +3887,10 @@ impl<'db> CallableBinding<'db> {
         // `*arg` where `arg` is a union of a 2-tuple and a 3-tuple, we shouldn't eliminate any
         // overload for arity reasons before trying argument expansion.
         let argument_expansions = call_arguments.expansions(db, env);
+        // Constructor inference still needs one specialization for the entire method chain.
+        // Preserve its existing expansion rules until it can retain every expanded result.
+        let positions_can_change =
+            !self.is_constructor() && argument_expansions.has_expandable_variadic();
         let (should_retry_after_provisional_arity, overloads_for_expansion) = if self
             .should_retry_after_provisional_arity(&argument_expansions)
         {
@@ -3919,7 +3923,7 @@ impl<'db> CallableBinding<'db> {
                         call_expression_tcx,
                     );
                     if !self.overloads[index].has_errors_affecting_overload_resolution()
-                        || !argument_expansions.has_expandable_variadic()
+                        || !positions_can_change
                     {
                         return;
                     }
@@ -4013,7 +4017,6 @@ impl<'db> CallableBinding<'db> {
         // This heuristic tries to detect if there's any need to perform argument type expansion or
         // not by checking whether there are any non-expandable argument type that cannot be
         // assigned to any of the overloads.
-        let positions_can_change = argument_expansions.has_expandable_variadic();
         for (argument_index, call_argument) in call_arguments.iter().enumerate() {
             let argument = call_argument.kind();
             // TODO: Remove `Keywords` once `**kwargs` support is added
@@ -4245,11 +4248,19 @@ impl<'db> CallableBinding<'db> {
         }
     }
 
+    /// Whether this callable participates in constructor inference.
+    fn is_constructor(&self) -> bool {
+        self.overloads
+            .iter()
+            .any(|overload| overload.constructor_context.is_some())
+    }
+
     fn should_retry_after_provisional_arity(
         &self,
         expansions: &CallArgumentExpansions<'_, '_, 'db>,
     ) -> bool {
-        self.matching_overloads().count() < self.overloads.len()
+        (self.overloads.len() > 1 || !self.is_constructor())
+            && self.matching_overloads().count() < self.overloads.len()
             && expansions.has_expandable_variadic()
     }
 
