@@ -85,9 +85,8 @@ impl<'db> PositionalMatches<'db> {
         arguments: &CallArguments<'_, 'db>,
         parameters: &Parameters<'db>,
         explicit_keywords: &FxHashSet<usize>,
-        allow_trailing_unpack: bool,
     ) -> Option<Self> {
-        if (!allow_trailing_unpack && arguments.has_provisional_types(db, env))
+        if (arguments.constructor_lengths().is_none() && arguments.has_provisional_types(db, env))
             || parameters
                 .variadic()
                 .is_some_and(|(_, parameter)| parameter.has_starred_annotation())
@@ -151,11 +150,10 @@ impl<'db> PositionalMatches<'db> {
 
         // With no later positional input, preserve the existing treatment of a single
         // homogeneous unpack, including checking its elements against defaulted parameters.
-        if !allow_trailing_unpack
-            && !segments
-                .iter()
-                .take(segments.len().saturating_sub(1))
-                .any(|segment| segment.repeated)
+        if !segments
+            .iter()
+            .take(segments.len().saturating_sub(1))
+            .any(|segment| segment.repeated)
         {
             return None;
         }
