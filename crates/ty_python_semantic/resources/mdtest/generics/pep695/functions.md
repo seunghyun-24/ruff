@@ -3932,6 +3932,21 @@ def _(before: list[int], values: list[str], after: list[int]) -> None:
     reveal_type(middle(*before, values, *after))  # revealed: str
 ```
 
+## Variadic calls retain whole return types
+
+Either the unpack or `ints` can fill `value`, and any remaining arguments go to `rest`. The result
+can be an integer list or a string list; an integer cannot safely be appended to both.
+
+```py
+def first[T](value: list[T], *rest: object) -> list[T]:
+    return value
+
+def _(before: list[list[str]], ints: list[int]) -> None:
+    result = first(*before, ints)
+    reveal_type(result)  # revealed: list[int] | list[str]
+    result.append(1)  # error: [invalid-argument-type]
+```
+
 ## Lambdas after positional unpacks
 
 Neither placement of this lambda is valid: it cannot accept the integer `1`, and the callbacks in
