@@ -8475,6 +8475,7 @@ impl<'db> Binding<'db> {
             .signature
             .generic_context
             .map_or(TypeVarSet::None, |context| context.inferable_typevars(db));
+        let mut provisional = false;
         let positional_constraints = self.positional_matches.as_ref().and_then(|positional| {
             let evaluated = positional.evaluate(
                 db,
@@ -8484,6 +8485,7 @@ impl<'db> Binding<'db> {
                 parameters,
                 inferable_typevars,
             );
+            provisional = evaluated.provisional;
             for (index, argument) in arguments.iter().enumerate() {
                 if matches!(
                     argument,
@@ -8496,6 +8498,14 @@ impl<'db> Binding<'db> {
             }
             evaluated.constraints
         });
+
+        if provisional {
+            // Provisional lambda parameters cannot establish a new successful placement.
+            // Keep the ordinary diagnostics until inference has resolved their types.
+            self.reset(db);
+            self.match_parameters(db, env, arguments);
+            return self.check_types(db, env, arguments, call_expression_tcx);
+        }
 
         let inferred = CallInference {
             db,
